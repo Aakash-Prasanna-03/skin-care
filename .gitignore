@@ -1,0 +1,39 @@
+# Ignore all data folders and their contents
+data/
+!data/**/*.md
+!data/**/*.py
+!data/**/*.js
+!data/**/*.json
+!data/**/*.csv
+
+# Ignore all image files in uploads and data
+uploads/
+!uploads/**/*.md
+
+# Ignore checkpoints and logs
+checkpoints/
+logs/
+
+# Ignore Python cache and egg-info
+__pycache__/
+skin_analysis.egg-info/
+
+# Ignore prediction results except summary.json
+prediction_results/
+!prediction_results/summary.json
+
+# Ignore all .js files except in the main project (if any)
+*.js
+!*.js
+
+# Allow all programming files (Python, JS, TOML, etc.)
+!*.py
+!*.ipynb
+!*.toml
+!*.md
+!*.json
+!*.csv
+
+# Ignore system files
+.DS_Store
+Thumbs.db
