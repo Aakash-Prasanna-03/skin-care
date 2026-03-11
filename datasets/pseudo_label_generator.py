@@ -23,6 +23,7 @@ from tqdm import tqdm
 from preprocessing.face_pipeline import (
     FacePreprocessor,
     extract_cheek_region,
+    extract_texture_region,
     extract_undereye_region,
 )
 
@@ -42,7 +43,7 @@ class PseudoLabelGenerator:
         Directory where computed labels are cached as JSON.
     """
 
-    def __init__(self, cache_dir: str = "data/cache/pseudo_labels"):
+    def __init__(self, cache_dir: str = "data/cache/pseudo_labels_region_v2"):
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self._preprocessor = FacePreprocessor()
@@ -114,7 +115,6 @@ class PseudoLabelGenerator:
         if bgr is None:
             return None
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-        h, w = rgb.shape[:2]
 
         # Landmarks
         mesh_result = self._mesh.process(rgb)
@@ -123,7 +123,12 @@ class PseudoLabelGenerator:
             raw = mesh_result.multi_face_landmarks[0].landmark
             lm = np.array([[p.x, p.y] for p in raw], dtype=np.float32)
 
-        texture_score     = self._texture_score(rgb)
+        texture_region = extract_texture_region(rgb, lm) if lm is not None else None
+        if texture_region is None or texture_region.size == 0:
+            h, w = rgb.shape[:2]
+            texture_region = rgb[int(h * 0.15):int(h * 0.45), int(w * 0.22):int(w * 0.78)]
+
+        texture_score     = self._texture_score(texture_region)
         redness_score     = self._redness_score(rgb, lm)
         dark_circle_score = self._dark_circle_score(rgb, lm)
 
@@ -184,8 +189,8 @@ class PseudoLabelGenerator:
         a_channel = lab[:, :, 1].astype(np.float32)     # 0-255, neutral=128
         mean_a = float(np.mean(a_channel))
 
-        # Map [128, 200] → [0, 1]  (values > 128 = reddish)
-        score = (mean_a - 128.0) / 72.0
+        # Map [133, 165] → [0, 1]  (tighter range for facial skin redness sensitivity)
+        score = (mean_a - 133.0) / 32.0
         return float(np.clip(score, 0.0, 1.0))
 
     @staticmethod
@@ -212,4 +217,9 @@ class PseudoLabelGenerator:
             return 0.0
 
         contrast = (l_cheek - l_eye) / (l_cheek + 1e-6)
-        return float(np.clip(contrast, 0.0, 1.0))
+        # Amplify subtle differences (raw contrast often < 0.1)
+        score = contrast * 2.5
+        return float(np.clip(score, 0.0, 1.0))
+
+
+

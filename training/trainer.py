@@ -16,17 +16,19 @@ from typing import Dict, List, Tuple
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, WeightedRandomSampler
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 from config import DataConfig, ModelConfig, TrainConfig
-from datasets.loaders import ACNE04Dataset, CelebADataset, CombinedSkinDataset, FFHQDataset
+from datasets.loaders import ACNE04Dataset, CelebADataset, CombinedSkinDataset, ExtremeSamplesDataset, FFHQDataset
 from models.skin_model import SkinAnalysisModel
+from utils.metrics import DistributionChecker
 
 
 class MaskedRegressionLoss(nn.Module):
-    def __init__(self, loss_type: str = "mse", beta: float = 1.0):
+    def __init__(self, loss_type: str = "smooth_l1", beta: float = 0.1):
         super().__init__()
         if loss_type == "smooth_l1":
             self._fn = nn.SmoothL1Loss(reduction="none", beta=beta)
@@ -41,6 +43,47 @@ class MaskedRegressionLoss(nn.Module):
             return torch.tensor(0.0, device=pred.device, requires_grad=True), 0
         loss = self._fn(pred[mask], target[mask])
         return loss.mean(), int(mask.sum().item())
+
+
+class OrdinalCrossEntropy(nn.Module):
+    """Loss for CORAL-style ordinal classification.
+
+    Converts a scalar target (0.0 / 0.33 / 0.66 / 1.0) to ordinal class index
+    (0/1/2/3), then computes BCE on cumulative binary indicators.
+
+    Label smoothing shifts hard 0/1 targets towards 0.5 to prevent overconfidence.
+    """
+    # Map from regression-style target → ordinal class index
+    _TARGET_TO_CLASS = {0.0: 0, 0.33: 1, 0.66: 2, 1.0: 3}
+
+    def __init__(self, label_smoothing: float = 0.05):
+        super().__init__()
+        self.label_smoothing = label_smoothing
+
+    def forward(self, logits: torch.Tensor, target: torch.Tensor) -> Tuple[torch.Tensor, int]:
+        """logits: (B, 3) raw logits, target: (B,) with values in {0.0, 0.33, 0.66, 1.0, NaN}"""
+        mask = ~torch.isnan(target)
+        if mask.sum() == 0:
+            return torch.tensor(0.0, device=logits.device, requires_grad=True), 0
+
+        valid_logits = logits[mask]            # (N, 3)
+        valid_targets = target[mask]           # (N,)
+
+        # Convert regression target → ordinal class index
+        ordinal_classes = torch.zeros_like(valid_targets, dtype=torch.long)
+        for reg_val, cls_idx in self._TARGET_TO_CLASS.items():
+            ordinal_classes[torch.abs(valid_targets - reg_val) < 0.05] = cls_idx
+
+        # Build cumulative binary targets: [y>=1, y>=2, y>=3]
+        thresholds = torch.arange(1, 4, device=logits.device).float().unsqueeze(0)  # (1, 3)
+        binary_targets = (ordinal_classes.unsqueeze(-1) >= thresholds).float()          # (N, 3)
+
+        # Label smoothing: shift hard 0/1 towards 0.5 to prevent overconfidence
+        if self.label_smoothing > 0:
+            binary_targets = binary_targets * (1.0 - self.label_smoothing) + 0.5 * self.label_smoothing
+
+        loss = F.binary_cross_entropy_with_logits(valid_logits, binary_targets, reduction="mean")
+        return loss, int(mask.sum().item())
 
 
 class SkinModelTrainer:
@@ -65,6 +108,7 @@ class SkinModelTrainer:
         print(f"[Trainer] Parameters - total: {stats['total']:,}, trainable: {stats['trainable']:,}")
 
         self.criterion = MaskedRegressionLoss(loss_type=train_cfg.loss_fn, beta=train_cfg.beta)
+        self.acne_criterion = OrdinalCrossEntropy()
         self.head_weights = {
             "acne_score": train_cfg.acne_weight,
             "redness_score": train_cfg.redness_weight,
@@ -75,6 +119,7 @@ class SkinModelTrainer:
             "acne04": train_cfg.acne_dataset_weight,
             "celeba": train_cfg.celeba_dataset_weight,
             "ffhq": train_cfg.ffhq_dataset_weight,
+            "extreme": 3.0,  # High weight: hand-curated extreme samples
         }
 
         self.optimizer = torch.optim.AdamW(
@@ -95,12 +140,17 @@ class SkinModelTrainer:
         self.writer = SummaryWriter(log_dir=train_cfg.log_dir)
         self.best_val_loss = float("inf")
         self.global_step = 0
+        self.dist_checker = DistributionChecker()
 
     def _build_base_datasets(self) -> List:
         datasets = []
 
         try:
-            datasets.append(ACNE04Dataset(root=self.data_cfg.acne04_root, train=False))
+            datasets.append(ACNE04Dataset(
+                root=self.data_cfg.acne04_root,
+                train=False,
+                pseudo_label_cache_dir=self.data_cfg.pseudo_label_cache_dir,
+            ))
         except FileNotFoundError as exc:
             print(f"[Warning] ACNE04 skipped: {exc}")
 
@@ -129,6 +179,16 @@ class SkinModelTrainer:
             )
         except FileNotFoundError as exc:
             print(f"[Warning] FFHQ skipped: {exc}")
+
+        try:
+            datasets.append(ExtremeSamplesDataset(
+                root=self.data_cfg.extreme_samples_root,
+                train=False,
+                pseudo_label_cache_dir=self.data_cfg.pseudo_label_cache_dir,
+                seed=self.train_cfg.seed,
+            ))
+        except FileNotFoundError as exc:
+            print(f"[Warning] Extreme samples skipped: {exc}")
 
         if not datasets:
             raise RuntimeError("No datasets found. Check your data paths.")
@@ -211,6 +271,8 @@ class SkinModelTrainer:
 
         return torch.optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda)
 
+    _REGRESSION_KEYS = ("redness_score", "texture_score", "dark_circle_score")
+
     def _compute_total_loss(
         self,
         preds: Dict[str, torch.Tensor],
@@ -218,10 +280,18 @@ class SkinModelTrainer:
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         total = torch.tensor(0.0, device=self.device)
         per_head = {}
-        for key in self.HEAD_KEYS:
+
+        # Ordinal loss for acne
+        acne_loss, _ = self.acne_criterion(preds["acne_score"], labels["acne_score"].to(self.device))
+        total = total + self.head_weights["acne_score"] * acne_loss
+        per_head["acne_score"] = acne_loss.item()
+
+        # Regression loss for other heads
+        for key in self._REGRESSION_KEYS:
             head_loss, _ = self.criterion(preds[key], labels[key].to(self.device))
             total = total + self.head_weights[key] * head_loss
             per_head[key] = head_loss.item()
+
         return total, per_head
 
     def _train_epoch(self, epoch: int) -> float:
@@ -231,7 +301,7 @@ class SkinModelTrainer:
 
         progress = tqdm(self.train_loader, desc=f"Epoch {epoch + 1} [train]", leave=False)
         for images, labels in progress:
-            images = images.to(self.device, non_blocking=True)
+            images = {key: value.to(self.device, non_blocking=True) for key, value in images.items()}
 
             with torch.amp.autocast(
                 device_type="cuda", enabled=self.train_cfg.use_amp and self.device.type == "cuda"
@@ -263,14 +333,16 @@ class SkinModelTrainer:
         self.model.eval()
         total_loss = 0.0
         n_batches = 0
+        self.dist_checker.reset()
 
         for images, labels in tqdm(self.val_loader, desc=f"Epoch {epoch + 1} [val]", leave=False):
-            images = images.to(self.device, non_blocking=True)
+            images = {key: value.to(self.device, non_blocking=True) for key, value in images.items()}
             with torch.amp.autocast(
                 device_type="cuda", enabled=self.train_cfg.use_amp and self.device.type == "cuda"
             ):
                 scores = self.model(images)
                 loss, _ = self._compute_total_loss(scores.to_dict(), labels)
+            self.dist_checker.update(scores.to_dict())
             total_loss += loss.item()
             n_batches += 1
 
@@ -293,6 +365,10 @@ class SkinModelTrainer:
                 f"lr={lr:.2e} | {elapsed:.1f}s"
             )
             self.writer.add_scalar("lr", lr, epoch)
+
+            # Print distribution diagnostics every 5 epochs
+            if (epoch + 1) % 5 == 0 or epoch == 0:
+                print(self.dist_checker.summary_str())
 
             if val_loss < self.best_val_loss:
                 self.best_val_loss = val_loss

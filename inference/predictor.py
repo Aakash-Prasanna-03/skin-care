@@ -1,7 +1,7 @@
 """
 inference/predictor.py
 
-End-to-end inference for uploaded face images.
+End-to-end inference for region-aware uploaded face analysis.
 """
 
 from __future__ import annotations
@@ -72,12 +72,7 @@ class SkinPredictor:
     MAX_BRIGHTNESS = 200.0
     MIN_BLUR_VARIANCE = 80.0
 
-    def __init__(
-        self,
-        checkpoint_path: Union[str, Path],
-        cfg: Optional[InferenceConfig] = None,
-        device: Optional[str] = None,
-    ):
+    def __init__(self, checkpoint_path: Union[str, Path], cfg: Optional[InferenceConfig] = None, device: Optional[str] = None):
         self.cfg = cfg or InferenceConfig()
         self.device = torch.device(device) if device is not None else torch.device(
             "cuda" if torch.cuda.is_available() else "cpu"
@@ -102,49 +97,19 @@ class SkinPredictor:
     def predict_from_path(self, image_path: Union[str, Path]) -> SkinReport:
         bgr = cv2.imread(str(image_path))
         if bgr is None:
-            return SkinReport(
-                acne_score=0.0,
-                redness_score=0.0,
-                texture_score=0.0,
-                dark_circle_score=0.0,
-                overall_score=0.0,
-                face_detected=False,
-                error=f"Could not read image: {image_path}",
-            )
+            return SkinReport(0.0, 0.0, 0.0, 0.0, 0.0, face_detected=False, error=f"Could not read image: {image_path}")
         return self.predict_from_array(bgr)
 
-    def predict_from_array(self, bgr: np.ndarray) -> SkinReport:
+    def predict_from_array(self, bgr) -> SkinReport:
         quality = self.preprocessor.assess_image_quality(bgr)
         quality_error = self._quality_error(quality)
         if quality_error is not None:
-            return SkinReport(
-                acne_score=0.0,
-                redness_score=0.0,
-                texture_score=0.0,
-                dark_circle_score=0.0,
-                overall_score=0.0,
-                face_detected=bool(quality.get("face_detected", False)),
-                error=quality_error,
-                quality_checks=quality,
-            )
+            return SkinReport(0.0, 0.0, 0.0, 0.0, 0.0, face_detected=bool(quality.get("face_detected", False)), error=quality_error, quality_checks=quality)
 
-        tensor, _ = self.preprocessor(bgr)
-        if tensor is None:
-            return SkinReport(
-                acne_score=0.0,
-                redness_score=0.0,
-                texture_score=0.0,
-                dark_circle_score=0.0,
-                overall_score=0.0,
-                face_detected=False,
-                error="Face alignment failed for this image.",
-                quality_checks=quality,
-            )
-
-        return self._run_model(tensor, quality)
-
-    def predict_from_tensor(self, tensor: torch.Tensor) -> SkinReport:
-        return self._run_model(tensor, quality={})
+        regions, _ = self.preprocessor(bgr)
+        if regions is None:
+            return SkinReport(0.0, 0.0, 0.0, 0.0, 0.0, face_detected=False, error="Face alignment failed for this image.", quality_checks=quality)
+        return self._run_model(regions, quality)
 
     def _quality_error(self, quality: Dict[str, object]) -> Optional[str]:
         if not quality.get("face_detected", False):
@@ -159,23 +124,45 @@ class SkinPredictor:
             return "Image is too blurry. Please upload a sharper photo."
         return None
 
+    @staticmethod
+    def _clamp_score(raw: float, low: float = 0.05, high: float = 0.95) -> float:
+        """Compress extreme model outputs to a believable range."""
+        return max(low, min(high, raw))
+
+    def _robust_overall(self, scores: Dict[str, float]) -> float:
+        """Winsorized weighted mean: caps any head contributing > 50% of total."""
+        weights = {
+            "acne": self.cfg.acne_weight,
+            "redness": self.cfg.redness_weight,
+            "texture": self.cfg.texture_weight,
+            "dark_circle": self.cfg.dark_circle_weight,
+        }
+        total_w = sum(weights.values())
+        raw_overall = sum(scores[k] * weights[k] for k in scores) / total_w
+
+        # Winsorize: if any single head dominates, clamp its influence
+        adjusted = dict(scores)
+        for k in scores:
+            contribution = scores[k] * weights[k] / (raw_overall * total_w + 1e-6)
+            if contribution > 0.50:
+                adjusted[k] = min(scores[k], raw_overall * 1.5)
+
+        return sum(adjusted[k] * weights[k] for k in adjusted) / total_w
+
     @torch.no_grad()
-    def _run_model(self, tensor: torch.Tensor, quality: Dict[str, object]) -> SkinReport:
-        x = tensor.unsqueeze(0).to(self.device)
-        with torch.cuda.amp.autocast(enabled=self.device.type == "cuda"):
-            scores = self.model(x)
+    def _run_model(self, regions: Dict[str, torch.Tensor], quality: Dict[str, object]) -> SkinReport:
+        inputs = {key: value.unsqueeze(0).to(self.device) for key, value in regions.items()}
+        with torch.amp.autocast(device_type="cuda", enabled=self.device.type == "cuda"):
+            scores = self.model(inputs)
 
         raw = scores.to_cpu_dict()
-        acne = float(raw["acne_score"])
-        redness = float(raw["redness_score"])
-        texture = float(raw["texture_score"])
-        dark_circle = float(raw["dark_circle_score"])
-        overall = (
-            self.cfg.acne_weight * acne
-            + self.cfg.redness_weight * redness
-            + self.cfg.texture_weight * texture
-            + self.cfg.dark_circle_weight * dark_circle
-        )
+        acne = self._clamp_score(float(raw["acne_score"]))
+        redness = self._clamp_score(float(raw["redness_score"]))
+        texture = self._clamp_score(float(raw["texture_score"]))
+        dark_circle = self._clamp_score(float(raw["dark_circle_score"]))
+
+        score_dict = {"acne": acne, "redness": redness, "texture": texture, "dark_circle": dark_circle}
+        overall = self._clamp_score(self._robust_overall(score_dict))
 
         severity = {
             "acne": _score_to_severity(acne),
@@ -184,13 +171,4 @@ class SkinPredictor:
             "dark_circle": _score_to_severity(dark_circle),
             "overall": _score_to_severity(overall),
         }
-        return SkinReport(
-            acne_score=acne,
-            redness_score=redness,
-            texture_score=texture,
-            dark_circle_score=dark_circle,
-            overall_score=overall,
-            face_detected=True,
-            severity=severity,
-            quality_checks=quality,
-        )
+        return SkinReport(acne, redness, texture, dark_circle, overall, face_detected=True, severity=severity, quality_checks=quality)

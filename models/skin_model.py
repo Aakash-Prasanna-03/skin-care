@@ -1,13 +1,11 @@
 """
 models/skin_model.py
 
-ResNet18 backbone with a shared FC + four sigmoid regression heads.
-
-Output keys:
-  acne_score
-  redness_score
-  texture_score
-  dark_circle_score
+Region-aware skin analysis model using:
+- full face for acne/context
+- cheek crop for redness
+- under-eye crop for dark circles
+- texture patch for texture
 """
 
 from __future__ import annotations
@@ -22,38 +20,85 @@ import timm
 
 @dataclass
 class SkinScores:
-    acne_score:        torch.Tensor   # (B,)
-    redness_score:     torch.Tensor
-    texture_score:     torch.Tensor
+    acne_score: torch.Tensor          # ordinal: (B, 3) cumulative probs during training
+    redness_score: torch.Tensor
+    texture_score: torch.Tensor
     dark_circle_score: torch.Tensor
 
     def to_dict(self) -> Dict[str, torch.Tensor]:
         return {
-            "acne_score":        self.acne_score,
-            "redness_score":     self.redness_score,
-            "texture_score":     self.texture_score,
+            "acne_score": self.acne_score,
+            "redness_score": self.redness_score,
+            "texture_score": self.texture_score,
             "dark_circle_score": self.dark_circle_score,
         }
 
     def to_cpu_dict(self) -> Dict[str, float]:
-        return {k: v.squeeze().item() for k, v in self.to_dict().items()}
+        out = {}
+        for key, value in self.to_dict().items():
+            v = value.detach().cpu()
+            if v.dim() > 1:
+                # Ordinal head: sigmoid(logits) → cumulative probs → mean → scalar score
+                out[key] = float(torch.sigmoid(v).squeeze(0).mean().item())
+            else:
+                out[key] = float(v.squeeze().item())
+        return out
+
+
+class RegionEncoder(nn.Module):
+    def __init__(self, backbone: str, pretrained: bool, proj_dim: int):
+        super().__init__()
+        self.backbone = timm.create_model(
+            backbone,
+            pretrained=pretrained,
+            num_classes=0,
+            global_pool="avg",
+        )
+        self.proj = nn.Sequential(
+            nn.Linear(self.backbone.num_features, proj_dim),
+            nn.BatchNorm1d(proj_dim),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.proj(self.backbone(x))
+
+
+class OrdinalHead(nn.Module):
+    """CORAL-style ordinal classification: K-1 cumulative binary classifiers."""
+
+    def __init__(self, in_dim: int, num_classes: int = 4):
+        super().__init__()
+        self.num_thresholds = num_classes - 1  # 3 thresholds for 4 ordinal levels
+        self.fc = nn.Sequential(
+            nn.Linear(in_dim, 64),
+            nn.ReLU(inplace=True),
+            nn.Linear(64, self.num_thresholds),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Returns raw logits for cumulative thresholds. Shape: (B, 3)
+        Use with binary_cross_entropy_with_logits during training."""
+        return self.fc(x)
+
+    def to_score(self, logits: torch.Tensor) -> torch.Tensor:
+        """Convert logits to a [0, 1] scalar via sigmoid + mean. Shape: (B,)"""
+        return torch.sigmoid(logits).mean(dim=-1)
+
+
+class RegressionHead(nn.Sequential):
+    """Standard Sigmoid regression head for continuous targets."""
+
+    def __init__(self, in_dim: int):
+        super().__init__(
+            nn.Linear(in_dim, 64),
+            nn.ReLU(inplace=True),
+            nn.Linear(64, 1),
+            nn.Sigmoid(),
+        )
 
 
 class SkinAnalysisModel(nn.Module):
-    """
-    Architecture
-    ────────────
-    ResNet18 (ImageNet pre-trained)
-      → Global Average Pool  (built-in to timm)
-      → Dropout
-      → Shared FC  (1408 → shared_fc_dim)
-      → BatchNorm + ReLU
-      → Four independent heads  (shared_fc_dim → 1)
-      → Sigmoid
-    """
-
-    HEAD_NAMES = ("acne_score", "redness_score", "texture_score", "dark_circle_score")
-
     def __init__(
         self,
         backbone: str = "resnet18",
@@ -62,90 +107,67 @@ class SkinAnalysisModel(nn.Module):
         dropout_rate: float = 0.3,
     ):
         super().__init__()
+        region_dim = max(64, shared_fc_dim // 2)
+        self.full_face_encoder = RegionEncoder(backbone, pretrained, region_dim)
+        self.cheek_encoder = RegionEncoder(backbone, pretrained, region_dim)
+        self.undereye_encoder = RegionEncoder(backbone, pretrained, region_dim)
+        self.texture_encoder = RegionEncoder(backbone, pretrained, region_dim)
 
-        # ── Backbone ──────────────────────────────────────────────────────────
-        self.backbone = timm.create_model(
-            backbone,
-            pretrained=pretrained,
-            num_classes=0,        # Remove classifier head; returns feature vector
-            global_pool="avg",    # Global Average Pooling
-        )
-        feat_dim = self.backbone.num_features   # EfficientNet-B2 → 1408
-
-        # ── Shared trunk ──────────────────────────────────────────────────────
+        fused_dim = region_dim * 4
         self.shared_trunk = nn.Sequential(
             nn.Dropout(p=dropout_rate),
-            nn.Linear(feat_dim, shared_fc_dim),
+            nn.Linear(fused_dim, shared_fc_dim),
             nn.BatchNorm1d(shared_fc_dim),
             nn.ReLU(inplace=True),
         )
-
-        # ── Four regression heads ─────────────────────────────────────────────
-        self.head_acne        = self._make_head(shared_fc_dim)
-        self.head_redness     = self._make_head(shared_fc_dim)
-        self.head_texture     = self._make_head(shared_fc_dim)
-        self.head_dark_circle = self._make_head(shared_fc_dim)
-
-        # ── Weight initialisation for new layers ──────────────────────────────
+        self.acne_head = OrdinalHead(region_dim + shared_fc_dim, num_classes=4)
+        self.redness_head = RegressionHead(region_dim + shared_fc_dim)
+        self.texture_head = RegressionHead(region_dim + shared_fc_dim)
+        self.dark_circle_head = RegressionHead(region_dim + shared_fc_dim)
         self._init_weights()
 
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _make_head(in_dim: int) -> nn.Sequential:
-        return nn.Sequential(
-            nn.Linear(in_dim, 64),
-            nn.ReLU(inplace=True),
-            nn.Linear(64, 1),
-            nn.Sigmoid(),
-        )
-
     def _init_weights(self):
-        for module in [self.shared_trunk, self.head_acne, self.head_redness,
-                       self.head_texture, self.head_dark_circle]:
-            for m in module.modules():
-                if isinstance(m, nn.Linear):
-                    nn.init.kaiming_normal_(m.weight, nonlinearity="relu")
-                    if m.bias is not None:
-                        nn.init.zeros_(m.bias)
-                elif isinstance(m, nn.BatchNorm1d):
-                    nn.init.ones_(m.weight)
-                    nn.init.zeros_(m.bias)
+        for module in [
+            self.full_face_encoder.proj,
+            self.cheek_encoder.proj,
+            self.undereye_encoder.proj,
+            self.texture_encoder.proj,
+            self.shared_trunk,
+            self.acne_head,
+            self.redness_head,
+            self.texture_head,
+            self.dark_circle_head,
+        ]:
+            for layer in module.modules():
+                if isinstance(layer, nn.Linear):
+                    nn.init.kaiming_normal_(layer.weight, nonlinearity="relu")
+                    if layer.bias is not None:
+                        nn.init.zeros_(layer.bias)
+                elif isinstance(layer, nn.BatchNorm1d):
+                    nn.init.ones_(layer.weight)
+                    nn.init.zeros_(layer.bias)
 
-    # ------------------------------------------------------------------
-    # Forward
-    # ------------------------------------------------------------------
+    def forward(self, inputs: Dict[str, torch.Tensor]) -> SkinScores:
+        full_face = self.full_face_encoder(inputs["full_face"])
+        cheek = self.cheek_encoder(inputs["cheek"])
+        undereye = self.undereye_encoder(inputs["undereye"])
+        texture = self.texture_encoder(inputs["texture"])
 
-    def forward(self, x: torch.Tensor) -> SkinScores:
-        """
-        Parameters
-        ----------
-        x : torch.Tensor  (B, 3, 224, 224)
+        fused = self.shared_trunk(torch.cat([full_face, cheek, undereye, texture], dim=1))
 
-        Returns
-        -------
-        SkinScores  (all scores in [0, 1])
-        """
-        features = self.backbone(x)
-        shared   = self.shared_trunk(features) # (B, shared_fc_dim)
+        acne_features = torch.cat([fused, full_face], dim=1)
+        redness_features = torch.cat([fused, cheek], dim=1)
+        texture_features = torch.cat([fused, texture], dim=1)
+        dark_features = torch.cat([fused, undereye], dim=1)
 
         return SkinScores(
-            acne_score        = self.head_acne(shared).squeeze(1),         # (B,)
-            redness_score     = self.head_redness(shared).squeeze(1),
-            texture_score     = self.head_texture(shared).squeeze(1),
-            dark_circle_score = self.head_dark_circle(shared).squeeze(1),
+            acne_score=self.acne_head(acne_features),             # (B, 3) ordinal
+            redness_score=self.redness_head(redness_features).squeeze(1),
+            texture_score=self.texture_head(texture_features).squeeze(1),
+            dark_circle_score=self.dark_circle_head(dark_features).squeeze(1),
         )
 
-    def freeze_backbone(self):
-        """Freeze backbone weights (useful for early-stage fine-tuning)."""
-        for p in self.backbone.parameters():
-            p.requires_grad = False
-
-    def unfreeze_backbone(self):
-        for p in self.backbone.parameters():
-            p.requires_grad = True
-
     def count_parameters(self) -> Dict[str, int]:
-        total   = sum(p.numel() for p in self.parameters())
-        trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        total = sum(param.numel() for param in self.parameters())
+        trainable = sum(param.numel() for param in self.parameters() if param.requires_grad)
         return {"total": total, "trainable": trainable}

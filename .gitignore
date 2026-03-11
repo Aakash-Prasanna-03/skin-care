@@ -1,39 +1,54 @@
-# Ignore all data folders and their contents
+# ── Data & images ──────────────────────────────────────────────
 data/
 !data/**/*.md
 !data/**/*.py
-!data/**/*.js
 !data/**/*.json
 !data/**/*.csv
 
-# Ignore all image files in uploads and data
+# ── Uploads ────────────────────────────────────────────────────
 uploads/
-!uploads/**/*.md
+uploads1/
 
-# Ignore checkpoints and logs
+# ── Model checkpoints & training logs ─────────────────────────
 checkpoints/
 logs/
 
-# Ignore Python cache and egg-info
-__pycache__/
-skin_analysis.egg-info/
-
-# Ignore prediction results except summary.json
+# ── Prediction / evaluation results ───────────────────────────
 prediction_results/
-!prediction_results/summary.json
+prediction_results1/
+prediction_results_new/
 
-# Ignore all .js files except in the main project (if any)
-*.js
-!*.js
+# ── Python build / cache artefacts ────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+skin_analysis.egg-info/
+dist/
+build/
+*.egg
 
-# Allow all programming files (Python, JS, TOML, etc.)
-!*.py
-!*.ipynb
-!*.toml
-!*.md
-!*.json
-!*.csv
+# ── Virtual environments ──────────────────────────────────────
+.env/
+venv/
+env/
+.venv/
 
-# Ignore system files
+# ── IDE / editor settings ────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ── Archives ──────────────────────────────────────────────────
+*.zip
+
+# ── OS junk files ─────────────────────────────────────────────
 .DS_Store
 Thumbs.db
+desktop.ini
+
+# ── Misc utility scripts (not part of core pipeline) ─────────
+cudacheck.py
+pathfix.py
+verify_fixes.py

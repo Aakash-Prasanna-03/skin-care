@@ -14,9 +14,10 @@ class DataConfig:
     celeba_root: str = "data/img_align_celeba"
     celeba_attr_file: str = "data/img_align_celeba/list_attr_celeba.csv"
     ffhq_root: str = "data/ffhq"
+    extreme_samples_root: str = "data/extreme_samples"
 
     # ── Sampling ───────────────────────────────────────────────────────────────
-    celeba_sample_size: int = 15_000       # 10k–20k recommended
+    celeba_sample_size: int = 2_000
     ffhq_sample_size: int = 1_000
 
     # ── Preprocessing ─────────────────────────────────────────────────────────
@@ -25,12 +26,12 @@ class DataConfig:
     imagenet_std: Tuple[float, ...] = (0.229, 0.224, 0.225)
 
     # ── Cache directory for pseudo-labels ─────────────────────────────────────
-    pseudo_label_cache_dir: str = "data/cache/pseudo_labels"
+    pseudo_label_cache_dir: str = "data/cache/pseudo_labels_region_v2"
 
 
 @dataclass
 class ModelConfig:
-    backbone: str = "resnet18"
+    backbone: str = "efficientnet_b2"
     pretrained: bool = True
     shared_fc_dim: int = 256
     dropout_rate: float = 0.3
@@ -53,16 +54,16 @@ class TrainConfig:
     warmup_epochs: int = 3
 
     # ── Loss ──────────────────────────────────────────────────────────────────
-    loss_fn: str = "mse"                  # "smooth_l1" | "mse"
-    beta: float = 1.0                     # Smooth L1 beta
+    loss_fn: str = "smooth_l1"            # "smooth_l1" | "mse"
+    beta: float = 0.1                     # Smooth L1 beta (lower = more L1-like, outlier-robust)
 
     # ── Per-head loss weights ─────────────────────────────────────────────────
-    acne_weight: float = 2.5
-    redness_weight: float = 1.0
+    acne_weight: float = 2.0
+    redness_weight: float = 1.2
     texture_weight: float = 0.8
-    dark_circle_weight: float = 1.2
+    dark_circle_weight: float = 1.5
 
-    acne_dataset_weight: float = 4.0
+    acne_dataset_weight: float = 4.0      # Higher: ACNE04 is the only acne source
     celeba_dataset_weight: float = 1.0
     ffhq_dataset_weight: float = 1.5
 
@@ -105,3 +106,4 @@ class Config:
 
 # ── Convenience singleton ──────────────────────────────────────────────────────
 cfg = Config()
+

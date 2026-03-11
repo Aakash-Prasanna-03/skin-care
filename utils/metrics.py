@@ -74,6 +74,91 @@ class RunningMetrics:
         return "\n".join(lines)
 
 
+class DistributionChecker:
+    """Track prediction distributions per head to detect collapse and cross-head leakage."""
+
+    HEADS = RunningMetrics.HEADS
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self._preds: Dict[str, List[float]] = {k: [] for k in self.HEADS}
+
+    def update(self, preds: Dict[str, "torch.Tensor"]):
+        for key in self.HEADS:
+            if key not in preds:
+                continue
+            p = preds[key].detach().cpu()
+            if p.dim() > 1:
+                # Ordinal head: convert logits to probs then to scalar
+                p = torch.sigmoid(p).mean(dim=-1)
+            self._preds[key].extend(p.tolist())
+
+    def compute(self) -> Dict[str, Dict[str, float]]:
+        result = {}
+        for key in self.HEADS:
+            vals = self._preds[key]
+            if not vals:
+                result[key] = {"n": 0}
+                continue
+            arr = np.array(vals)
+            result[key] = {
+                "n": len(arr),
+                "min": float(arr.min()),
+                "max": float(arr.max()),
+                "mean": float(arr.mean()),
+                "std": float(arr.std()),
+                "pct_low": float((arr < 0.1).mean()),     # % collapsed near 0
+                "pct_high": float((arr > 0.9).mean()),    # % collapsed near 1
+            }
+        return result
+
+    def cross_head_correlations(self) -> Dict[str, float]:
+        """Pearson correlation between all head pairs. High correlation = potential leakage."""
+        import itertools
+        result = {}
+        for a, b in itertools.combinations(self.HEADS, 2):
+            va, vb = self._preds[a], self._preds[b]
+            n = min(len(va), len(vb))
+            if n < 10:
+                continue
+            aa, bb = np.array(va[:n]), np.array(vb[:n])
+            if aa.std() < 1e-6 or bb.std() < 1e-6:
+                result[f"{a}_vs_{b}"] = 0.0
+                continue
+            corr = float(np.corrcoef(aa, bb)[0, 1])
+            result[f"{a}_vs_{b}"] = corr
+        return result
+
+    def summary_str(self) -> str:
+        dist = self.compute()
+        lines = ["Prediction Distribution:"]
+        for k, v in dist.items():
+            if v.get("n", 0) == 0:
+                lines.append(f"  {k:<20s}: no data")
+                continue
+            flag = ""
+            if v["pct_low"] > 0.5:
+                flag = " ⚠️ COLLAPSED LOW"
+            elif v["pct_high"] > 0.5:
+                flag = " ⚠️ COLLAPSED HIGH"
+            lines.append(
+                f"  {k:<20s}: μ={v['mean']:.3f}  σ={v['std']:.3f}  "
+                f"[{v['min']:.3f}, {v['max']:.3f}]  "
+                f"lo={v['pct_low']:.0%} hi={v['pct_high']:.0%}{flag}"
+            )
+
+        corrs = self.cross_head_correlations()
+        if corrs:
+            lines.append("Cross-Head Correlations:")
+            for pair, r in corrs.items():
+                flag = " ⚠️ HIGH" if abs(r) > 0.8 else ""
+                lines.append(f"  {pair:<45s}: r={r:+.3f}{flag}")
+
+        return "\n".join(lines)
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # visualize.py
 # ──────────────────────────────────────────────────────────────────────────────

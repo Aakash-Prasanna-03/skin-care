@@ -38,36 +38,36 @@ EfficientNet-B2 (ImageNet pretrained)  — backbone
 ## Project Structure
 
 ```
-skin_analysis/
+Project/
 ├── config.py                        # Centralised config dataclasses
 ├── train.py                         # Training entry-point
-├── predict.py                       # Inference entry-point
-├── requirements.txt
+├── evaluate.py                      # Model evaluation on test sets
+├── run_uploaded_images.py           # Batch inference on uploaded images
+├── Pyproject.toml                   # Project metadata & dependencies
 │
 ├── preprocessing/
-│   ├── __init__.py
 │   └── face_pipeline.py             # MediaPipe face detection, alignment, crop, normalise
 │
 ├── datasets/
-│   ├── __init__.py
 │   ├── loaders.py                   # ACNE04Dataset, CelebADataset, FFHQDataset, CombinedSkinDataset
-│   └── pseudo_label_generator.py   # LBP texture, redness (LAB a*), dark-circle contrast
+│   └── pseudo_label_generator.py    # LBP texture, redness (LAB a*), dark-circle contrast
 │
 ├── models/
-│   ├── __init__.py
 │   └── skin_model.py                # SkinAnalysisModel (EfficientNet-B2 + 4 heads)
 │
 ├── training/
-│   ├── __init__.py
 │   └── trainer.py                   # SkinModelTrainer (masked loss, AMP, cosine LR, checkpointing)
 │
 ├── inference/
-│   ├── __init__.py
+│   ├── predict.py                   # CLI inference entry-point
 │   └── predictor.py                 # SkinPredictor + SkinReport
 │
-└── utils/
-    ├── __init__.py
-    └── metrics.py                   # RunningMetrics (MAE/RMSE), draw_skin_report
+├── utils/
+│   └── metrics.py                   # RunningMetrics (MAE/RMSE), draw_skin_report
+│
+├── data/                            # Datasets (git-ignored, see Dataset Setup)
+├── checkpoints/                     # Saved model weights (git-ignored)
+└── logs/                            # TensorBoard logs (git-ignored)
 ```
 
 ---
@@ -76,28 +76,28 @@ skin_analysis/
 
 ### ACNE04
 ```
-data/ACNE04/
-    0/   ← clear (label 0.0)
-    1/   ← mild  (label 0.33)
-    2/   ← moderate (label 0.66)
-    3/   ← severe (label 1.0)
+data/acne_1024/
+    acne0_1024/   ← clear (label 0.0)
+    acne1_1024/   ← mild  (label 0.33)
+    acne2_1024/   ← moderate (label 0.66)
+    acne3_1024/   ← severe (label 1.0)
 ```
 
 ### CelebA
 ```
-data/CelebA/
-    img_align_celeba/
-        000001.jpg
-        ...
+data/img_align_celeba/
+    000001.jpg
+    ...
     list_attr_celeba.csv   ← must include Rosy_Cheeks and Dark_Circles columns
 ```
 
 ### FFHQ
 ```
-data/FFHQ/
-    images/   ← or any nested subdirectory structure
-        00000.png
-        ...
+data/ffhq/
+    00000/
+    01000/
+    ...
+    09000/
 ```
 
 ---
@@ -105,7 +105,14 @@ data/FFHQ/
 ## Installation
 
 ```bash
-pip install -r requirements.txt
+pip install -e .
+```
+
+Or install dependencies directly:
+
+```bash
+pip install torch torchvision timm opencv-python mediapipe numpy albumentations \
+    pandas scikit-learn scikit-image Pillow tqdm matplotlib tensorboard PyYAML
 ```
 
 > Requires Python ≥ 3.9. CUDA 11.8+ recommended for GPU training.
@@ -154,16 +161,11 @@ tensorboard --logdir logs/
 
 ```bash
 # Single image:
-python predict.py --image face.jpg --checkpoint checkpoints/best_model.pth
-
-# Save annotated output:
-python predict.py --image face.jpg --checkpoint checkpoints/best_model.pth \
-                  --save_annotated result.jpg
+python inference/predict.py --image face.jpg --checkpoint checkpoints/best_model.pth
 
 # Batch directory + JSON output:
-python predict.py --image_dir ./faces/ \
-                  --checkpoint checkpoints/best_model.pth \
-                  --output_json results.json
+python run_uploaded_images.py --image_dir ./uploads/ \
+                              --checkpoint checkpoints/best_model.pth
 ```
 
 ### Python API
