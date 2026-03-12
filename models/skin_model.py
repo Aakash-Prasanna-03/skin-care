@@ -45,23 +45,18 @@ class SkinScores:
         return out
 
 
-class RegionEncoder(nn.Module):
-    def __init__(self, backbone: str, pretrained: bool, proj_dim: int):
+class RegionProjection(nn.Module):
+    """Lightweight per-region projection head (shared backbone feeds into these)."""
+    def __init__(self, in_features: int, proj_dim: int):
         super().__init__()
-        self.backbone = timm.create_model(
-            backbone,
-            pretrained=pretrained,
-            num_classes=0,
-            global_pool="avg",
-        )
         self.proj = nn.Sequential(
-            nn.Linear(self.backbone.num_features, proj_dim),
+            nn.Linear(in_features, proj_dim),
             nn.BatchNorm1d(proj_dim),
             nn.ReLU(inplace=True),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.proj(self.backbone(x))
+        return self.proj(x)
 
 
 class OrdinalHead(nn.Module):
@@ -101,17 +96,28 @@ class RegressionHead(nn.Sequential):
 class SkinAnalysisModel(nn.Module):
     def __init__(
         self,
-        backbone: str = "resnet18",
+        backbone: str = "efficientnet_b2",
         pretrained: bool = True,
         shared_fc_dim: int = 256,
         dropout_rate: float = 0.3,
     ):
         super().__init__()
         region_dim = max(64, shared_fc_dim // 2)
-        self.full_face_encoder = RegionEncoder(backbone, pretrained, region_dim)
-        self.cheek_encoder = RegionEncoder(backbone, pretrained, region_dim)
-        self.undereye_encoder = RegionEncoder(backbone, pretrained, region_dim)
-        self.texture_encoder = RegionEncoder(backbone, pretrained, region_dim)
+
+        # Single shared backbone for all regions (saves ~75% params)
+        self.shared_backbone = timm.create_model(
+            backbone,
+            pretrained=pretrained,
+            num_classes=0,
+            global_pool="avg",
+        )
+        backbone_features = self.shared_backbone.num_features
+
+        # Lightweight per-region projections
+        self.full_face_proj = RegionProjection(backbone_features, region_dim)
+        self.cheek_proj = RegionProjection(backbone_features, region_dim)
+        self.undereye_proj = RegionProjection(backbone_features, region_dim)
+        self.texture_proj = RegionProjection(backbone_features, region_dim)
 
         fused_dim = region_dim * 4
         self.shared_trunk = nn.Sequential(
@@ -128,10 +134,10 @@ class SkinAnalysisModel(nn.Module):
 
     def _init_weights(self):
         for module in [
-            self.full_face_encoder.proj,
-            self.cheek_encoder.proj,
-            self.undereye_encoder.proj,
-            self.texture_encoder.proj,
+            self.full_face_proj.proj,
+            self.cheek_proj.proj,
+            self.undereye_proj.proj,
+            self.texture_proj.proj,
             self.shared_trunk,
             self.acne_head,
             self.redness_head,
@@ -147,11 +153,22 @@ class SkinAnalysisModel(nn.Module):
                     nn.init.ones_(layer.weight)
                     nn.init.zeros_(layer.bias)
 
+    def _encode_region(self, x: torch.Tensor) -> torch.Tensor:
+        """Pass a region through the shared backbone."""
+        return self.shared_backbone(x)
+
     def forward(self, inputs: Dict[str, torch.Tensor]) -> SkinScores:
-        full_face = self.full_face_encoder(inputs["full_face"])
-        cheek = self.cheek_encoder(inputs["cheek"])
-        undereye = self.undereye_encoder(inputs["undereye"])
-        texture = self.texture_encoder(inputs["texture"])
+        # All regions share the same backbone
+        full_face_feat = self._encode_region(inputs["full_face"])
+        cheek_feat = self._encode_region(inputs["cheek"])
+        undereye_feat = self._encode_region(inputs["undereye"])
+        texture_feat = self._encode_region(inputs["texture"])
+
+        # Per-region projections
+        full_face = self.full_face_proj(full_face_feat)
+        cheek = self.cheek_proj(cheek_feat)
+        undereye = self.undereye_proj(undereye_feat)
+        texture = self.texture_proj(texture_feat)
 
         fused = self.shared_trunk(torch.cat([full_face, cheek, undereye, texture], dim=1))
 
@@ -161,7 +178,7 @@ class SkinAnalysisModel(nn.Module):
         dark_features = torch.cat([fused, undereye], dim=1)
 
         return SkinScores(
-            acne_score=self.acne_head(acne_features),             # (B, 3) ordinal
+            acne_score=self.acne_head(acne_features),
             redness_score=self.redness_head(redness_features).squeeze(1),
             texture_score=self.texture_head(texture_features).squeeze(1),
             dark_circle_score=self.dark_circle_head(dark_features).squeeze(1),

@@ -21,7 +21,7 @@ class DataConfig:
     ffhq_sample_size: int = 1_000
 
     # ── Preprocessing ─────────────────────────────────────────────────────────
-    image_size: Tuple[int, int] = (224, 224)
+    image_size: Tuple[int, int] = (260, 260)
     imagenet_mean: Tuple[float, ...] = (0.485, 0.456, 0.406)
     imagenet_std: Tuple[float, ...] = (0.229, 0.224, 0.225)
 
@@ -64,7 +64,7 @@ class TrainConfig:
     dark_circle_weight: float = 1.5
 
     # Progressive acne weight: linearly ramps from acne_weight to this value
-    acne_weight_final: float = 6.0
+    acne_weight_final: float = 4.5
 
     # Differential LR: backbone/shared trunk use lr * this factor
     backbone_lr_factor: float = 0.3

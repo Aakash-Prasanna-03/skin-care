@@ -108,8 +108,8 @@ class _BaseSkinDataset(Dataset):
 class ACNE04Dataset(_BaseSkinDataset):
     source_name = "acne04"
 
-    # Cap clear-skin (class 0) to a fixed maximum of 320 images.
-    MAX_CLASS0: int = 320
+    # Cap clear-skin (class 0) to a fixed maximum of 340 images.
+    MAX_CLASS0: int = 340
 
     def __init__(self, root: str, train: bool = True, pseudo_label_cache_dir: str = "data/cache/pseudo_labels_region_v2", **kwargs):
         root = Path(root)
@@ -265,11 +265,13 @@ class ExtremeSamplesDataset(_BaseSkinDataset):
     """
     source_name = "extreme"
 
-    # folder_name → dict of labels to set
-    _FOLDER_MAP = {
-        "dark_circles_severe": {"dark_circle_score": 0.80},
-        "redness_severe":      {"redness_score": 0.85, "texture_score": 0.60},
-        "clear_skin":          {"dark_circle_score": 0.10, "redness_score": 0.10, "texture_score": 0.20},
+    # folder_name → dict of labels to set (used for clear_skin only now)
+    _CLEAR_LABELS = {"dark_circle_score": 0.05, "redness_score": 0.05, "texture_score": 0.05, "acne_score": 0.0}
+
+    # For ranked folders: pseudo-label key → (min, max) range to scale into
+    _RANKED_FOLDERS = {
+        "dark_circles_severe": {"dark_circle_score": (0.50, 0.90)},
+        "redness_severe":      {"redness_score": (0.40, 0.80), "texture_score": (0.30, 0.60)},
     }
 
     # Ordinal heads must use exact values — jitter would break class mapping
@@ -281,49 +283,84 @@ class ExtremeSamplesDataset(_BaseSkinDataset):
             raise FileNotFoundError(f"Extreme samples directory not found: {root}")
 
         rng = random.Random(seed + 99)
-        image_paths, primary_labels = [], []
 
-        for folder_name, labels_dict in self._FOLDER_MAP.items():
+        # Generate pseudo-labels first so we can rank images
+        all_image_paths = []
+        image_folder_map = {}  # path → folder_name
+        for folder_name in list(self._RANKED_FOLDERS.keys()) + ["clear_skin"]:
             folder = root / folder_name
             if not folder.is_dir():
                 continue
             for ext in ("*.jpg", "*.jpeg", "*.png", "*.bmp", "*.webp"):
                 for path in folder.glob(ext):
-                    # Jitter ±0.05 for natural variance for each label
-                    jittered_labels = {}
-                    for k, center in labels_dict.items():
-                        if k in self._NO_JITTER_KEYS:
-                            jittered_labels[k] = center  # exact ordinal value
-                        else:
-                            jittered_labels[k] = max(0.0, min(1.0, center + (rng.random() - 0.5) * 0.10))
-                    image_paths.append(str(path))
-                    primary_labels.append(jittered_labels)
+                    path_str = str(path)
+                    all_image_paths.append(path_str)
+                    image_folder_map[path_str] = folder_name
 
-        if not image_paths:
+        if not all_image_paths:
             raise FileNotFoundError(f"No extreme sample images found in {root}")
 
-        # Generate pseudo-labels for OTHER heads (texture, etc.)
         generator = PseudoLabelGenerator(cache_dir=pseudo_label_cache_dir)
-        pseudo = generator.generate_for_dataset(image_paths, dataset_name="extreme")
+        pseudo = generator.generate_for_dataset(all_image_paths, dataset_name="extreme")
 
-        labels = []
-        for path, primary_lbls in zip(image_paths, primary_labels):
-            pl = pseudo.get(path, {})
+        # For ranked folders, collect pseudo scores per key to rank and rescale
+        folder_paths = {}  # folder_name → [path, ...]
+        for path_str, folder_name in image_folder_map.items():
+            folder_paths.setdefault(folder_name, []).append(path_str)
+
+        # Compute rescaled labels for ranked folders
+        ranked_labels = {}  # path → {key: rescaled_value}
+        for folder_name, key_ranges in self._RANKED_FOLDERS.items():
+            paths = folder_paths.get(folder_name, [])
+            if not paths:
+                continue
+            for key, (lo, hi) in key_ranges.items():
+                # Collect raw pseudo scores for this key across the folder
+                raw_scores = []
+                for p in paths:
+                    pl = pseudo.get(p, {})
+                    raw_scores.append(pl.get(key, 0.5))
+
+                # Rank-based rescaling: sort, assign evenly spaced values in [lo, hi]
+                n = len(raw_scores)
+                sorted_indices = sorted(range(n), key=lambda i: raw_scores[i])
+                for rank, idx in enumerate(sorted_indices):
+                    if n > 1:
+                        scaled = lo + (hi - lo) * (rank / (n - 1))
+                    else:
+                        scaled = (lo + hi) / 2.0
+                    # Add small jitter ±0.03
+                    scaled = max(0.0, min(1.0, scaled + (rng.random() - 0.5) * 0.06))
+                    ranked_labels.setdefault(paths[idx], {})[key] = scaled
+
+        # Build final label list
+        image_paths, labels = [], []
+        for path_str in all_image_paths:
+            folder_name = image_folder_map[path_str]
+            pl = pseudo.get(path_str, {})
             label = _make_label_dict()  # all NaN by default
 
-            # Set the primary labels from folder
-            for k, val in primary_lbls.items():
-                label[k] = val
+            if folder_name == "clear_skin":
+                # Fixed labels for clear skin
+                for k, center in self._CLEAR_LABELS.items():
+                    if k in self._NO_JITTER_KEYS:
+                        label[k] = center
+                    else:
+                        label[k] = max(0.0, min(1.0, center + (rng.random() - 0.5) * 0.10))
+            elif folder_name in self._RANKED_FOLDERS:
+                # Use rank-scaled labels for primary keys
+                rl = ranked_labels.get(path_str, {})
+                for k, val in rl.items():
+                    label[k] = val
 
-            # Fill in pseudo-labels for other heads where available
+            # Fill in pseudo-labels for non-primary heads
             if pl:
-                if "redness_score" not in primary_lbls and "redness_score" in pl:
-                    label["redness_score"] = pl["redness_score"]
-                if "dark_circle_score" not in primary_lbls and "dark_circle_score" in pl:
-                    label["dark_circle_score"] = pl["dark_circle_score"]
-                if "texture_score" not in primary_lbls and "texture_score" in pl:
-                    label["texture_score"] = pl["texture_score"]
+                for k in ("redness_score", "dark_circle_score", "texture_score"):
+                    if label[k] != label[k]:  # is NaN
+                        if k in pl:
+                            label[k] = pl[k]
 
+            image_paths.append(path_str)
             labels.append(label)
 
         super().__init__(image_paths, labels, train=train, **kwargs)

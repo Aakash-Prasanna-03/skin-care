@@ -166,8 +166,14 @@ class PseudoLabelGenerator:
         grad_var_norm = np.clip(grad_var / 3000.0, 0.0, 1.0)      # empirical max
 
         score = 0.55 * lbp_entropy_norm + 0.45 * grad_var_norm
-        # Slight upward shift so texture is more sensitive
-        score = score * 1.1
+
+        # Skin-tone correction: darker skin has higher gradient variance
+        # from natural pigmentation, not texture roughness
+        mean_brightness = float(np.mean(gray))
+        if mean_brightness < 140.0:
+            darkness_factor = (140.0 - mean_brightness) / 80.0  # 0.0 to ~1.0
+            score = score * (1.0 - darkness_factor * 0.25)  # reduce up to 25%
+
         return float(np.clip(score, 0.0, 1.0))
 
     @staticmethod
@@ -229,17 +235,19 @@ class PseudoLabelGenerator:
         if l_eye is None or l_cheek is None or l_cheek < 1e-6:
             return 0.0
 
-        # Relative contrast (already skin-tone normalized since it's a ratio)
+        # Relative contrast (already partially skin-tone normalized since it's a ratio)
         contrast = (l_cheek - l_eye) / (l_cheek + 1e-6)
 
-        # For darker skin, the natural contrast between under-eye and cheek
-        # is higher, so slightly reduce the amplification factor
+        # Darker skin naturally has higher under-eye contrast due to
+        # hyperpigmentation — subtract a baseline and reduce amplification
         amplification = 2.5
-        if l_cheek < 120.0:  # darker skin
-            darkness_ratio = max(0.7, l_cheek / 120.0)  # 0.7 to 1.0
-            amplification = 2.5 * darkness_ratio  # 1.75 to 2.5
+        baseline = 0.0
+        if l_cheek < 140.0:  # medium-dark to dark skin
+            darkness_factor = (140.0 - l_cheek) / 80.0  # 0.0 to ~1.0
+            amplification = 2.5 * max(0.5, 1.0 - darkness_factor * 0.5)  # 1.25 to 2.5
+            baseline = darkness_factor * 0.06  # subtract up to 0.06 natural contrast
 
-        score = contrast * amplification
+        score = max(0.0, contrast - baseline) * amplification
         return float(np.clip(score, 0.0, 1.0))
 
 

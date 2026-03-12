@@ -33,7 +33,7 @@ _FOREHEAD = [9, 10, 151, 337, 108]
 _MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 _STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
-TARGET_SIZE = (224, 224)
+TARGET_SIZE = (260, 260)
 REGION_KEYS = ("full_face", "cheek", "undereye", "texture")
 
 
@@ -199,15 +199,18 @@ def _central_patch(image_rgb: np.ndarray, top: float, bottom: float, left: float
     return image_rgb[y1:y2, x1:x2]
 
 
-def _crop_from_indices(image_rgb: np.ndarray, lm: np.ndarray, indices, pad: int = 8):
+def _crop_from_indices(image_rgb: np.ndarray, lm: np.ndarray, indices, pad_ratio: float = 0.05):
     h, w = image_rgb.shape[:2]
     pts = (lm[indices] * np.array([w, h])).astype(int)
     if len(pts) == 0:
         return None
     x1, y1 = pts.min(axis=0)
     x2, y2 = pts.max(axis=0)
-    x1, y1 = max(0, x1 - pad), max(0, y1 - pad)
-    x2, y2 = min(w, x2 + pad), min(h, y2 + pad)
+    # Relative padding based on crop size
+    pw = max(1, int((x2 - x1) * pad_ratio))
+    ph = max(1, int((y2 - y1) * pad_ratio))
+    x1, y1 = max(0, x1 - pw), max(0, y1 - ph)
+    x2, y2 = min(w, x2 + pw), min(h, y2 + ph)
     if x2 <= x1 or y2 <= y1:
         return None
     return image_rgb[y1:y2, x1:x2]
@@ -219,7 +222,7 @@ def extract_undereye_region(image_rgb: np.ndarray, lm: np.ndarray, side: str = "
         "right": _RIGHT_UNDEREYE,
         "both": _LEFT_UNDEREYE + _RIGHT_UNDEREYE,
     }[side]
-    return _crop_from_indices(image_rgb, lm, indices, pad=20)
+    return _crop_from_indices(image_rgb, lm, indices, pad_ratio=0.15)
 
 
 def extract_cheek_region(image_rgb: np.ndarray, lm: np.ndarray, side: str = "both") -> Optional[np.ndarray]:
@@ -228,11 +231,11 @@ def extract_cheek_region(image_rgb: np.ndarray, lm: np.ndarray, side: str = "bot
         "right": _RIGHT_CHEEK,
         "both": _LEFT_CHEEK + _RIGHT_CHEEK,
     }[side]
-    return _crop_from_indices(image_rgb, lm, indices, pad=25)
+    return _crop_from_indices(image_rgb, lm, indices, pad_ratio=0.20)
 
 
 def extract_texture_region(image_rgb: np.ndarray, lm: np.ndarray) -> Optional[np.ndarray]:
-    region = _crop_from_indices(image_rgb, lm, _FOREHEAD, pad=10)
+    region = _crop_from_indices(image_rgb, lm, _FOREHEAD, pad_ratio=0.10)
     if region is not None:
         return region
     cheek = extract_cheek_region(image_rgb, lm, side="both")

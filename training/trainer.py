@@ -54,7 +54,7 @@ class OrdinalCrossEntropy(nn.Module):
     Label smoothing shifts hard 0/1 targets towards 0.5 to prevent overconfidence.
     """
     # Map from regression-style target → ordinal class index
-    _TARGET_TO_CLASS = {0.0: 0, 0.33: 1, 0.66: 2, 1.0: 3}
+    _CLASS_TARGETS = torch.tensor([0.0, 0.33, 0.66, 1.0])  # ordinal class centers
 
     def __init__(self, label_smoothing: float = 0.05):
         super().__init__()
@@ -69,10 +69,11 @@ class OrdinalCrossEntropy(nn.Module):
         valid_logits = logits[mask]            # (N, 3)
         valid_targets = target[mask]           # (N,)
 
-        # Convert regression target → ordinal class index
-        ordinal_classes = torch.zeros_like(valid_targets, dtype=torch.long)
-        for reg_val, cls_idx in self._TARGET_TO_CLASS.items():
-            ordinal_classes[torch.abs(valid_targets - reg_val) < 0.05] = cls_idx
+        # Convert regression target → nearest ordinal class index
+        # Uses argmin distance so any value (even slightly jittered) maps correctly
+        class_targets = self._CLASS_TARGETS.to(valid_targets.device)  # (4,)
+        dists = torch.abs(valid_targets.unsqueeze(-1) - class_targets.unsqueeze(0))  # (N, 4)
+        ordinal_classes = dists.argmin(dim=-1)  # (N,)
 
         # Build cumulative binary targets: [y>=1, y>=2, y>=3]
         thresholds = torch.arange(1, 4, device=logits.device).float().unsqueeze(0)  # (1, 3)
@@ -119,7 +120,7 @@ class SkinModelTrainer:
             "acne04": train_cfg.acne_dataset_weight,
             "celeba": train_cfg.celeba_dataset_weight,
             "ffhq": train_cfg.ffhq_dataset_weight,
-            "extreme": 3.0,  # High weight: hand-curated extreme samples
+            "extreme": 3.0,  # Only source of real severe dark_circle / redness images
         }
 
         # Differential learning rates: slower backbone/shared trunk, faster task heads
@@ -153,6 +154,7 @@ class SkinModelTrainer:
         Path(train_cfg.log_dir).mkdir(parents=True, exist_ok=True)
         self.writer = SummaryWriter(log_dir=train_cfg.log_dir)
         self.best_val_loss = float("inf")
+        self.best_val_mae = float("inf")
         self.best_acne_val_loss = float("inf")
         self.global_step = 0
         self.dist_checker = DistributionChecker()
@@ -354,7 +356,7 @@ class SkinModelTrainer:
         return total_loss / max(1, n_batches)
 
     @torch.no_grad()
-    def _val_epoch(self, epoch: int) -> float:
+    def _val_epoch(self, epoch: int) -> Tuple[float, float, float]:
         self.model.eval()
         total_loss = 0.0
         n_batches = 0
@@ -363,14 +365,28 @@ class SkinModelTrainer:
         acne_val_loss_sum = 0.0
         acne_val_batches = 0
 
+        # MAE accumulators for regression heads
+        mae_sums = {k: 0.0 for k in self._REGRESSION_KEYS}
+        mae_counts = {k: 0 for k in self._REGRESSION_KEYS}
+
         for images, labels in tqdm(self.val_loader, desc=f"Epoch {epoch + 1} [val]", leave=False):
             images = {key: value.to(self.device, non_blocking=True) for key, value in images.items()}
             with torch.amp.autocast(
                 device_type="cuda", enabled=self.train_cfg.use_amp and self.device.type == "cuda"
             ):
                 scores = self.model(images)
-                loss, per_head = self._compute_total_loss(scores.to_dict(), labels, epoch=epoch)
-            self.dist_checker.update(scores.to_dict())
+                preds = scores.to_dict()
+                loss, per_head = self._compute_total_loss(preds, labels, epoch=epoch)
+
+            # Accumulate per-head MAE for regression heads
+            for key in self._REGRESSION_KEYS:
+                target = labels[key].to(self.device)
+                mask = ~torch.isnan(target)
+                if mask.sum() > 0:
+                    mae_sums[key] += (preds[key][mask] - target[mask]).abs().sum().item()
+                    mae_counts[key] += int(mask.sum().item())
+
+            self.dist_checker.update(preds)
             total_loss += loss.item()
             n_batches += 1
             if per_head.get("acne_score", 0.0) > 0:
@@ -379,11 +395,22 @@ class SkinModelTrainer:
 
         avg_loss = total_loss / max(1, n_batches)
         avg_acne_loss = acne_val_loss_sum / max(1, acne_val_batches)
+
+        # Average MAE across regression heads (weight-invariant metric)
+        head_maes = []
+        for key in self._REGRESSION_KEYS:
+            if mae_counts[key] > 0:
+                head_mae = mae_sums[key] / mae_counts[key]
+                head_maes.append(head_mae)
+                self.writer.add_scalar(f"val/mae_{key}", head_mae, epoch)
+        avg_mae = sum(head_maes) / max(1, len(head_maes))
+
         self.writer.add_scalar("val/loss", avg_loss, epoch)
         self.writer.add_scalar("val/acne_loss", avg_acne_loss, epoch)
+        self.writer.add_scalar("val/avg_mae", avg_mae, epoch)
         for key, value in per_head.items():
             self.writer.add_scalar(f"val/{key}", value, epoch)
-        return avg_loss, avg_acne_loss
+        return avg_loss, avg_acne_loss, avg_mae
 
     def train(self):
         print(f"[Trainer] Starting training for {self.train_cfg.epochs} epochs.")
@@ -391,7 +418,7 @@ class SkinModelTrainer:
         for epoch in range(self.train_cfg.epochs):
             start = time.time()
             train_loss = self._train_epoch(epoch)
-            val_loss, acne_val_loss = self._val_epoch(epoch)
+            val_loss, acne_val_loss, val_mae = self._val_epoch(epoch)
             elapsed = time.time() - start
             lr = self.scheduler.get_last_lr()[0]
 
@@ -399,8 +426,8 @@ class SkinModelTrainer:
             print(
                 f"Epoch {epoch + 1:3d}/{self.train_cfg.epochs} | "
                 f"train_loss={train_loss:.4f} | val_loss={val_loss:.4f} | "
-                f"acne_val={acne_val_loss:.4f} | acne_w={acne_w:.1f} | "
-                f"lr={lr:.2e} | {elapsed:.1f}s"
+                f"acne_val={acne_val_loss:.4f} | val_mae={val_mae:.4f} | "
+                f"acne_w={acne_w:.1f} | lr={lr:.2e} | {elapsed:.1f}s"
             )
             self.writer.add_scalar("lr", lr, epoch)
 
@@ -408,9 +435,15 @@ class SkinModelTrainer:
             if (epoch + 1) % 5 == 0 or epoch == 0:
                 print(self.dist_checker.summary_str())
 
+            # Best model selection: use weight-invariant MAE
+            if val_mae < self.best_val_mae:
+                self.best_val_mae = val_mae
+                self._save_checkpoint(epoch, val_loss, best=True)
+                print(f"  New best model (val_mae={val_mae:.4f})")
+
+            # Track best weighted loss separately
             if val_loss < self.best_val_loss:
                 self.best_val_loss = val_loss
-                self._save_checkpoint(epoch, val_loss, best=True)
 
             # Save best acne checkpoint separately
             if acne_val_loss < self.best_acne_val_loss:
@@ -422,7 +455,8 @@ class SkinModelTrainer:
                 self._save_checkpoint(epoch, val_loss, best=False)
 
         self.writer.close()
-        print(f"[Trainer] Done. Best val loss: {self.best_val_loss:.4f}")
+        print(f"[Trainer] Done. Best val MAE: {self.best_val_mae:.4f}")
+        print(f"[Trainer] Best val loss: {self.best_val_loss:.4f}")
         print(f"[Trainer] Best acne val loss: {self.best_acne_val_loss:.4f}")
 
     def _save_checkpoint(self, epoch: int, val_loss: float, best: bool, tag: str = ""):

@@ -39,7 +39,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--pseudo_cache",   default="data/cache/pseudo_labels_region_v2")
 
     # Model
-    p.add_argument("--backbone",       default="resnet18")
+    p.add_argument("--backbone",       default="efficientnet_b2")
     p.add_argument("--shared_fc",      type=int, default=256)
     p.add_argument("--dropout",        type=float, default=0.3)
 
@@ -50,7 +50,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--weight_decay",   type=float, default=1e-4)
     p.add_argument("--loss",           choices=["smooth_l1", "mse"], default="smooth_l1")
     p.add_argument("--acne_weight",    type=float, default=3.0)
-    p.add_argument("--acne_weight_final", type=float, default=6.0, help="Acne weight ramps linearly to this")
+    p.add_argument("--acne_weight_final", type=float, default=4.5, help="Acne weight ramps linearly to this")
     p.add_argument("--redness_weight", type=float, default=1.2)
     p.add_argument("--texture_weight", type=float, default=0.8)
     p.add_argument("--dark_weight",    type=float, default=1.5)

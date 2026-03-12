@@ -59,17 +59,17 @@ class SkinReport:
 
 
 def _score_to_severity(score: float) -> str:
-    if score < 0.25:
+    if score < 0.10:
         return "Clear"
-    if score < 0.50:
+    if score < 0.35:
         return "Mild"
-    if score < 0.75:
+    if score < 0.70:
         return "Moderate"
     return "Severe"
 
 
 def _estimate_skin_tone(bgr: np.ndarray) -> float:
-    """Estimate skin lightness from the cheek area. Returns L* in [0, 100].
+    """Estimate skin lightness from the cheek area. Returns OpenCV L* in [0, 255].
 
     Lower L* = darker skin. Used to correct bias where darker skin
     inflates redness / dark_circle / texture scores.
@@ -78,7 +78,7 @@ def _estimate_skin_tone(bgr: np.ndarray) -> float:
     # Central cheek region (rough crop)
     cheek = bgr[int(h * 0.35):int(h * 0.70), int(w * 0.20):int(w * 0.80)]
     if cheek.size == 0:
-        return 65.0  # neutral default
+        return 140.0  # neutral default (no correction)
     lab = cv2.cvtColor(cheek, cv2.COLOR_BGR2LAB)
     return float(np.mean(lab[:, :, 0]))  # L* channel, range 0-255 in OpenCV
 
@@ -99,24 +99,27 @@ def _skin_tone_correction(score: float, lightness: float, sensitivity: float = 0
 
 
 class SkinPredictor:
-        @staticmethod
-        def _calibrate_dark_circle(raw: float) -> float:
-            """Remap dark circles so clear=0.08-0.12, moderate=0.55-0.70, severe=0.85+ (like acne).
+    @staticmethod
+    def _calibrate_dark_circle(raw: float) -> float:
+        """Remap dark circles:
+        - Clear:    0.00–0.10
+        - Mild:     0.10–0.35
+        - Moderate: 0.35–0.70
+        - Severe:   0.70–1.00
+        """
+        if raw < 0.25:
+            # Clear: compress [0.0, 0.25] → [0.0, 0.10]
+            return raw * 0.40
+        elif raw < 0.50:
+            # Mild: map [0.25, 0.50] → [0.10, 0.35]
+            return 0.10 + (raw - 0.25) * 1.0
+        elif raw < 0.75:
+            # Moderate: map [0.50, 0.75] → [0.35, 0.70]
+            return 0.35 + (raw - 0.50) * 1.4
+        else:
+            # Severe: map [0.75, 1.0] → [0.70, 1.0]
+            return 0.70 + (raw - 0.75) * 1.2
 
-            Uses a piecewise linear mapping to fix the floor and preserve the ceiling.
-            """
-            if raw < 0.25:
-                # Clear range: map [0.05, 0.25] → [0.08, 0.12]
-                return max(0.08, 0.08 + (raw - 0.05) * 0.20)
-            elif raw < 0.50:
-                # Mild range: map [0.25, 0.50] → [0.10, 0.40]
-                return 0.10 + (raw - 0.25) * 1.2
-            elif raw < 0.75:
-                # Moderate range: map [0.50, 0.75] → [0.40, 0.70]
-                return 0.40 + (raw - 0.50) * 1.2
-            else:
-                # Severe range: map [0.75, 0.95] → [0.70, 0.95]
-                return 0.70 + (raw - 0.75) * 1.25
     MIN_BRIGHTNESS = 60.0
     MAX_BRIGHTNESS = 200.0
     MIN_BLUR_VARIANCE = 80.0
@@ -176,8 +179,8 @@ class SkinPredictor:
         return None
 
     @staticmethod
-    def _clamp_score(raw: float, low: float = 0.05, high: float = 0.95) -> float:
-        """Compress extreme model outputs to a believable range."""
+    def _clamp_score(raw: float, low: float = 0.0, high: float = 1.0) -> float:
+        """Clamp model outputs to valid range."""
         return max(low, min(high, raw))
 
     def _robust_overall(self, scores: Dict[str, float]) -> float:
@@ -202,45 +205,93 @@ class SkinPredictor:
 
     @staticmethod
     def _calibrate_acne(raw: float) -> float:
-        """Remap acne so clear=0.0-0.1, moderate=0.55-0.70, severe=0.85+.
-
-        Uses a piecewise linear mapping to fix the floor (too high) and
-        preserve the ceiling (severe must stay above 0.85).
+        """Remap acne so:
+        - Clear:    0.00–0.10
+        - Mild:     0.10–0.35
+        - Moderate: 0.35–0.70
+        - Severe:   0.70–1.00
         """
         if raw < 0.25:
-            # Clear range: map [0.05, 0.25] → [0.08, 0.12]
-            # This makes 'clear' less strict, so scores 0.08-0.12 are possible for nearly clear skin
-            return max(0.08, 0.08 + (raw - 0.05) * 0.20)
+            # Clear skin: compress [0.0, 0.25] → [0.0, 0.10]
+            return raw * 0.40
         elif raw < 0.50:
-            # Mild range: map [0.25, 0.50] → [0.10, 0.40]
-            return 0.10 + (raw - 0.25) * 1.2
+            # Mild: map [0.25, 0.50] → [0.10, 0.35]
+            return 0.10 + (raw - 0.25) * 1.0
         elif raw < 0.75:
-            # Moderate range: map [0.50, 0.75] → [0.40, 0.70]
-            return 0.40 + (raw - 0.50) * 1.2
+            # Moderate: map [0.50, 0.75] → [0.35, 0.70]
+            return 0.35 + (raw - 0.50) * 1.4
         else:
-            # Severe range: map [0.75, 0.95] → [0.70, 0.95]
-            return 0.70 + (raw - 0.75) * 1.25
+            # Severe: map [0.75, 1.0] → [0.70, 1.0]
+            return 0.70 + (raw - 0.75) * 1.2
+
+    @staticmethod
+    def _calibrate_redness(raw: float) -> float:
+        """Remap redness — less compression than acne so red faces stay high:
+        - Clear:    0.00–0.10
+        - Mild:     0.10–0.35
+        - Moderate: 0.35–0.70
+        - Severe:   0.70–1.00
+        """
+        if raw < 0.15:
+            # Clear: compress [0.0, 0.15] → [0.0, 0.10]
+            return raw * 0.667
+        elif raw < 0.35:
+            # Mild: map [0.15, 0.35] → [0.10, 0.35]
+            return 0.10 + (raw - 0.15) * 1.25
+        elif raw < 0.65:
+            # Moderate: map [0.35, 0.65] → [0.35, 0.70]
+            return 0.35 + (raw - 0.35) * 1.167
+        else:
+            # Severe: map [0.65, 1.0] → [0.70, 1.0]
+            return 0.70 + (raw - 0.65) * 0.857
+
+    @staticmethod
+    def _calibrate_texture(raw: float) -> float:
+        """Remap texture to severity buckets:
+        - Clear:    0.00–0.10
+        - Mild:     0.10–0.35
+        - Moderate: 0.35–0.70
+        - Severe:   0.70–1.00
+        """
+        if raw < 0.20:
+            # Clear: compress [0.0, 0.20] → [0.0, 0.10]
+            return raw * 0.50
+        elif raw < 0.45:
+            # Mild: map [0.20, 0.45] → [0.10, 0.35]
+            return 0.10 + (raw - 0.20) * 1.0
+        elif raw < 0.70:
+            # Moderate: map [0.45, 0.70] → [0.35, 0.70]
+            return 0.35 + (raw - 0.45) * 1.4
+        else:
+            # Severe: map [0.70, 1.0] → [0.70, 1.0]
+            return 0.70 + (raw - 0.70) * 1.0
 
     @staticmethod
     def _apply_acne_redness_correlation(acne: float, redness: float) -> float:
-        """When acne is moderate+, redness should be at least ~2/3 of acne.
+        """Redness is largely independent — rosacea, irritation, sunburn exist without acne.
 
-        Acne causes inflammation which manifests as redness.
-        Does NOT cap redness — extreme redness samples without acne stay as-is.
+        Only when acne is moderate+ does inflammation guarantee *some* redness.
+        Does NOT cap redness — high redness without acne stays as-is.
         """
-        if acne < 0.35:  # clear/mild acne — redness stands on its own
+        if acne < 0.36:  # clear/mild acne — redness stands entirely on its own
             return redness
-        acne_implied_redness = acne * 0.65
+        # Moderate+ acne implies significant redness from inflammation
+        acne_implied_redness = acne * 0.62
         return max(redness, acne_implied_redness)
 
     @staticmethod
     def _apply_acne_texture_correlation(acne: float, texture: float) -> float:
-        """When acne is present, texture should be proportionally elevated.
+        """Texture is mostly independent — pores, wrinkles, sun damage exist without acne.
 
-        Acne-prone skin has bumps/roughness. When acne is low, don't inflate texture.
+        Only when acne is moderate+ does inflammation imply some texture roughness.
+        Does NOT cap texture — high texture without acne stays as-is.
         """
-        # Texture should always be at least 65% of acne, regardless of acne level
-        return max(texture, acne * 0.65)
+        if acne < 0.35:
+            # Clear/mild acne — texture stands entirely on its own
+            return texture
+        # Moderate+ acne implies texture roughness (scales up with severity)
+        acne_implied_texture = acne * (0.23 + acne * 0.47)
+        return max(texture, acne_implied_texture)
 
     @torch.no_grad()
     def _run_model(self, regions: Dict[str, torch.Tensor], quality: Dict[str, object], skin_lightness: float = 140.0) -> SkinReport:
@@ -254,16 +305,19 @@ class SkinPredictor:
         acne = self._clamp_score(float(raw["acne_score"]))
         redness = self._clamp_score(float(raw["redness_score"]))
         texture = self._clamp_score(float(raw["texture_score"]))
-        dark_circle = self._clamp_score(self._calibrate_dark_circle(float(raw["dark_circle_score"])))
+        dark_circle = self._clamp_score(float(raw["dark_circle_score"]))
 
-        # 2. Acne calibration (compress overshooting)
+        # 2. Calibrate all scores to proper ranges
         acne = self._clamp_score(self._calibrate_acne(acne))
+        dark_circle = self._clamp_score(self._calibrate_dark_circle(dark_circle))
+        redness = self._clamp_score(self._calibrate_redness(redness))
+        texture = self._clamp_score(self._calibrate_texture(texture))
 
         # 3. Skin tone correction (reduce false positives on darker skin)
-        acne = _skin_tone_correction(acne, skin_lightness, sensitivity=0.12)
-        redness = _skin_tone_correction(redness, skin_lightness, sensitivity=0.14)
-        texture = _skin_tone_correction(texture, skin_lightness, sensitivity=0.12)
-        dark_circle = _skin_tone_correction(dark_circle, skin_lightness, sensitivity=0.18)
+        acne = _skin_tone_correction(acne, skin_lightness, sensitivity=0.15)
+        redness = _skin_tone_correction(redness, skin_lightness, sensitivity=0.20)
+        texture = _skin_tone_correction(texture, skin_lightness, sensitivity=0.25)
+        dark_circle = _skin_tone_correction(dark_circle, skin_lightness, sensitivity=0.35)
 
         # 4. Acne-correlated adjustments
         redness = self._clamp_score(self._apply_acne_redness_correlation(acne, redness))
