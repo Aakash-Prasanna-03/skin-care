@@ -122,11 +122,25 @@ class SkinModelTrainer:
             "extreme": 3.0,  # High weight: hand-curated extreme samples
         }
 
+        # Differential learning rates: slower backbone/shared trunk, faster task heads
+        backbone_params = []
+        head_params = []
+        for name, param in self.model.named_parameters():
+            if not param.requires_grad:
+                continue
+            if any(name.startswith(p) for p in ("acne_head.", "redness_head.", "texture_head.", "dark_circle_head.")):
+                head_params.append(param)
+            else:
+                backbone_params.append(param)
+
         self.optimizer = torch.optim.AdamW(
-            filter(lambda p: p.requires_grad, self.model.parameters()),
-            lr=train_cfg.learning_rate,
+            [
+                {"params": backbone_params, "lr": train_cfg.learning_rate * train_cfg.backbone_lr_factor},
+                {"params": head_params, "lr": train_cfg.learning_rate},
+            ],
             weight_decay=train_cfg.weight_decay,
         )
+        print(f"[Trainer] LR groups: backbone={train_cfg.learning_rate * train_cfg.backbone_lr_factor:.2e}, heads={train_cfg.learning_rate:.2e}")
 
         self.train_loader, self.val_loader = self._build_loaders()
         total_steps = max(1, len(self.train_loader) * train_cfg.epochs)
@@ -139,6 +153,7 @@ class SkinModelTrainer:
         Path(train_cfg.log_dir).mkdir(parents=True, exist_ok=True)
         self.writer = SummaryWriter(log_dir=train_cfg.log_dir)
         self.best_val_loss = float("inf")
+        self.best_acne_val_loss = float("inf")
         self.global_step = 0
         self.dist_checker = DistributionChecker()
 
@@ -273,17 +288,26 @@ class SkinModelTrainer:
 
     _REGRESSION_KEYS = ("redness_score", "texture_score", "dark_circle_score")
 
+    def _get_acne_weight(self, epoch: int) -> float:
+        """Linearly ramp acne weight from initial to final over training."""
+        base = self.train_cfg.acne_weight
+        final = self.train_cfg.acne_weight_final
+        progress = epoch / max(1, self.train_cfg.epochs - 1)
+        return base + (final - base) * progress
+
     def _compute_total_loss(
         self,
         preds: Dict[str, torch.Tensor],
         labels: Dict[str, torch.Tensor],
+        epoch: int = 0,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         total = torch.tensor(0.0, device=self.device)
         per_head = {}
 
-        # Ordinal loss for acne
+        # Ordinal loss for acne with progressive weight
         acne_loss, _ = self.acne_criterion(preds["acne_score"], labels["acne_score"].to(self.device))
-        total = total + self.head_weights["acne_score"] * acne_loss
+        acne_w = self._get_acne_weight(epoch)
+        total = total + acne_w * acne_loss
         per_head["acne_score"] = acne_loss.item()
 
         # Regression loss for other heads
@@ -307,7 +331,7 @@ class SkinModelTrainer:
                 device_type="cuda", enabled=self.train_cfg.use_amp and self.device.type == "cuda"
             ):
                 scores = self.model(images)
-                loss, per_head = self._compute_total_loss(scores.to_dict(), labels)
+                loss, per_head = self._compute_total_loss(scores.to_dict(), labels, epoch=epoch)
 
             self.optimizer.zero_grad()
             self.scaler.scale(loss).backward()
@@ -322,6 +346,7 @@ class SkinModelTrainer:
             self.global_step += 1
 
             self.writer.add_scalar("train/loss", loss.item(), self.global_step)
+            self.writer.add_scalar("train/acne_weight_effective", self._get_acne_weight(epoch), self.global_step)
             for key, value in per_head.items():
                 self.writer.add_scalar(f"train/{key}", value, self.global_step)
             progress.set_postfix({"loss": f"{loss.item():.4f}"})
@@ -335,33 +360,46 @@ class SkinModelTrainer:
         n_batches = 0
         self.dist_checker.reset()
 
+        acne_val_loss_sum = 0.0
+        acne_val_batches = 0
+
         for images, labels in tqdm(self.val_loader, desc=f"Epoch {epoch + 1} [val]", leave=False):
             images = {key: value.to(self.device, non_blocking=True) for key, value in images.items()}
             with torch.amp.autocast(
                 device_type="cuda", enabled=self.train_cfg.use_amp and self.device.type == "cuda"
             ):
                 scores = self.model(images)
-                loss, _ = self._compute_total_loss(scores.to_dict(), labels)
+                loss, per_head = self._compute_total_loss(scores.to_dict(), labels, epoch=epoch)
             self.dist_checker.update(scores.to_dict())
             total_loss += loss.item()
             n_batches += 1
+            if per_head.get("acne_score", 0.0) > 0:
+                acne_val_loss_sum += per_head["acne_score"]
+                acne_val_batches += 1
 
         avg_loss = total_loss / max(1, n_batches)
+        avg_acne_loss = acne_val_loss_sum / max(1, acne_val_batches)
         self.writer.add_scalar("val/loss", avg_loss, epoch)
-        return avg_loss
+        self.writer.add_scalar("val/acne_loss", avg_acne_loss, epoch)
+        for key, value in per_head.items():
+            self.writer.add_scalar(f"val/{key}", value, epoch)
+        return avg_loss, avg_acne_loss
 
     def train(self):
         print(f"[Trainer] Starting training for {self.train_cfg.epochs} epochs.")
+        print(f"[Trainer] Acne weight: {self.train_cfg.acne_weight:.1f} -> {self.train_cfg.acne_weight_final:.1f} (progressive)")
         for epoch in range(self.train_cfg.epochs):
             start = time.time()
             train_loss = self._train_epoch(epoch)
-            val_loss = self._val_epoch(epoch)
+            val_loss, acne_val_loss = self._val_epoch(epoch)
             elapsed = time.time() - start
             lr = self.scheduler.get_last_lr()[0]
 
+            acne_w = self._get_acne_weight(epoch)
             print(
                 f"Epoch {epoch + 1:3d}/{self.train_cfg.epochs} | "
                 f"train_loss={train_loss:.4f} | val_loss={val_loss:.4f} | "
+                f"acne_val={acne_val_loss:.4f} | acne_w={acne_w:.1f} | "
                 f"lr={lr:.2e} | {elapsed:.1f}s"
             )
             self.writer.add_scalar("lr", lr, epoch)
@@ -374,13 +412,20 @@ class SkinModelTrainer:
                 self.best_val_loss = val_loss
                 self._save_checkpoint(epoch, val_loss, best=True)
 
+            # Save best acne checkpoint separately
+            if acne_val_loss < self.best_acne_val_loss:
+                self.best_acne_val_loss = acne_val_loss
+                self._save_checkpoint(epoch, val_loss, best=False, tag="best_acne")
+                print(f"  New best acne model (acne_val_loss={acne_val_loss:.4f})")
+
             if (epoch + 1) % 10 == 0:
                 self._save_checkpoint(epoch, val_loss, best=False)
 
         self.writer.close()
         print(f"[Trainer] Done. Best val loss: {self.best_val_loss:.4f}")
+        print(f"[Trainer] Best acne val loss: {self.best_acne_val_loss:.4f}")
 
-    def _save_checkpoint(self, epoch: int, val_loss: float, best: bool):
+    def _save_checkpoint(self, epoch: int, val_loss: float, best: bool, tag: str = ""):
         checkpoint = {
             "epoch": epoch,
             "val_loss": val_loss,
@@ -398,6 +443,8 @@ class SkinModelTrainer:
         }
         if best:
             path = os.path.join(self.train_cfg.checkpoint_dir, "best_model.pth")
+        elif tag:
+            path = os.path.join(self.train_cfg.checkpoint_dir, f"{tag}.pth")
         else:
             path = os.path.join(self.train_cfg.checkpoint_dir, f"checkpoint_epoch{epoch + 1:03d}.pth")
         torch.save(checkpoint, path)

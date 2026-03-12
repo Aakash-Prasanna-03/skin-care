@@ -108,9 +108,13 @@ class _BaseSkinDataset(Dataset):
 class ACNE04Dataset(_BaseSkinDataset):
     source_name = "acne04"
 
+    # Cap clear-skin (class 0) to a fixed maximum of 320 images.
+    MAX_CLASS0: int = 320
+
     def __init__(self, root: str, train: bool = True, pseudo_label_cache_dir: str = "data/cache/pseudo_labels_region_v2", **kwargs):
         root = Path(root)
-        image_paths, acne_scores = [], []
+        # Collect images per severity class first
+        per_class: Dict[int, List[str]] = {0: [], 1: [], 2: [], 3: []}
         folder_map = {
             0: ["acne0_1024", "0"],
             1: ["acne1_1024", "1"],
@@ -118,15 +122,27 @@ class ACNE04Dataset(_BaseSkinDataset):
             3: ["acne3_1024", "3", "acne3_512_selection"],
         }
 
-        for severity, score in _ACNE_LABEL_MAP.items():
+        for severity in folder_map:
             for folder_name in folder_map[severity]:
                 subdir = root / folder_name
                 if not subdir.is_dir():
                     continue
                 for ext in ("*.jpg", "*.jpeg", "*.png"):
                     for path in subdir.glob(ext):
-                        image_paths.append(str(path))
-                        acne_scores.append(score)
+                        per_class[severity].append(str(path))
+
+        # Balance: cap class-0 so it doesn't dominate
+        if len(per_class[0]) > self.MAX_CLASS0:
+            rng = random.Random(42)
+            per_class[0] = rng.sample(per_class[0], self.MAX_CLASS0)
+            print(f"[ACNE04] Downsampled class-0 (clear) from original to {self.MAX_CLASS0} images (fixed cap)")
+
+        image_paths, acne_scores = [], []
+        for severity, paths in per_class.items():
+            score = _ACNE_LABEL_MAP[severity]
+            for p in paths:
+                image_paths.append(p)
+                acne_scores.append(score)
 
         if not image_paths:
             raise FileNotFoundError(f"No ACNE04 images found in {root}")
@@ -252,8 +268,8 @@ class ExtremeSamplesDataset(_BaseSkinDataset):
     # folder_name → dict of labels to set
     _FOLDER_MAP = {
         "dark_circles_severe": {"dark_circle_score": 0.80},
-        "redness_severe":      {"redness_score": 0.80, "texture_score": 0.575},
-        "clear_skin":          {"dark_circle_score": 0.10, "redness_score": 0.10, "texture_score": 0.20, "acne_score": 0.0},
+        "redness_severe":      {"redness_score": 0.85, "texture_score": 0.60},
+        "clear_skin":          {"dark_circle_score": 0.10, "redness_score": 0.10, "texture_score": 0.20},
     }
 
     # Ordinal heads must use exact values — jitter would break class mapping

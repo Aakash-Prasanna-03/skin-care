@@ -165,7 +165,9 @@ class PseudoLabelGenerator:
         grad_var = float(np.var(mag))
         grad_var_norm = np.clip(grad_var / 3000.0, 0.0, 1.0)      # empirical max
 
-        score = 0.5 * lbp_entropy_norm + 0.5 * grad_var_norm
+        score = 0.55 * lbp_entropy_norm + 0.45 * grad_var_norm
+        # Slight upward shift so texture is more sensitive
+        score = score * 1.1
         return float(np.clip(score, 0.0, 1.0))
 
     @staticmethod
@@ -173,6 +175,7 @@ class PseudoLabelGenerator:
         """
         Mean a* value over cheek regions converted to [0, 1].
         a* range in OpenCV uint8 LAB: 0-255, neutral=128.
+        Normalized relative to skin lightness to reduce bias on darker skin.
         """
         if lm is not None:
             region = extract_cheek_region(rgb, lm, side="both")
@@ -187,16 +190,26 @@ class PseudoLabelGenerator:
 
         lab = cv2.cvtColor(region, cv2.COLOR_RGB2LAB)
         a_channel = lab[:, :, 1].astype(np.float32)     # 0-255, neutral=128
+        l_channel = lab[:, :, 0].astype(np.float32)      # lightness
         mean_a = float(np.mean(a_channel))
+        mean_l = float(np.mean(l_channel))
 
-        # Map [133, 165] → [0, 1]  (tighter range for facial skin redness sensitivity)
+        # Base redness mapping: [133, 165] → [0, 1]
         score = (mean_a - 133.0) / 32.0
+
+        # Skin tone correction: darker skin (lower L*) naturally has higher a*
+        # Shift the baseline up for darker skin to avoid false redness
+        if mean_l < 140.0:
+            darkness_factor = (140.0 - mean_l) / 80.0  # 0 to ~1.0
+            score = score - darkness_factor * 0.2  # subtract up to 0.2 for very dark skin
+
         return float(np.clip(score, 0.0, 1.0))
 
     @staticmethod
     def _dark_circle_score(rgb: np.ndarray, lm: Optional[np.ndarray]) -> float:
         """
         Normalised contrast: (cheek_brightness - undereye_brightness) / cheek_brightness
+        Uses relative contrast so darker skin tones don't get inflated scores.
         """
         if lm is None:
             return 0.0
@@ -216,9 +229,17 @@ class PseudoLabelGenerator:
         if l_eye is None or l_cheek is None or l_cheek < 1e-6:
             return 0.0
 
+        # Relative contrast (already skin-tone normalized since it's a ratio)
         contrast = (l_cheek - l_eye) / (l_cheek + 1e-6)
-        # Amplify subtle differences (raw contrast often < 0.1)
-        score = contrast * 2.5
+
+        # For darker skin, the natural contrast between under-eye and cheek
+        # is higher, so slightly reduce the amplification factor
+        amplification = 2.5
+        if l_cheek < 120.0:  # darker skin
+            darkness_ratio = max(0.7, l_cheek / 120.0)  # 0.7 to 1.0
+            amplification = 2.5 * darkness_ratio  # 1.75 to 2.5
+
+        score = contrast * amplification
         return float(np.clip(score, 0.0, 1.0))
 
 
