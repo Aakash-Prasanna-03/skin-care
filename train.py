@@ -49,12 +49,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lr",             type=float, default=3e-4)
     p.add_argument("--weight_decay",   type=float, default=1e-4)
     p.add_argument("--loss",           choices=["smooth_l1", "mse"], default="smooth_l1")
+<<<<<<< HEAD
     p.add_argument("--acne_weight",    type=float, default=3.0)
     p.add_argument("--acne_weight_final", type=float, default=4.5, help="Acne weight ramps linearly to this")
+=======
+    p.add_argument("--acne_weight",    type=float, default=2.0)
+>>>>>>> parent of 7e1e563 (more detailed for acne and all)
     p.add_argument("--redness_weight", type=float, default=1.2)
     p.add_argument("--texture_weight", type=float, default=0.8)
     p.add_argument("--dark_weight",    type=float, default=1.5)
-    p.add_argument("--backbone_lr_factor", type=float, default=0.3, help="Backbone LR = lr * this factor")
     p.add_argument("--acne_dataset_weight",   type=float, default=4.0)
     p.add_argument("--celeba_dataset_weight", type=float, default=1.0)
     p.add_argument("--ffhq_dataset_weight",   type=float, default=1.5)
@@ -93,11 +96,9 @@ def main():
             weight_decay=args.weight_decay,
             loss_fn=args.loss,
             acne_weight=args.acne_weight,
-            acne_weight_final=args.acne_weight_final,
             redness_weight=args.redness_weight,
             texture_weight=args.texture_weight,
             dark_circle_weight=args.dark_weight,
-            backbone_lr_factor=args.backbone_lr_factor,
             acne_dataset_weight=args.acne_dataset_weight,
             celeba_dataset_weight=args.celeba_dataset_weight,
             ffhq_dataset_weight=args.ffhq_dataset_weight,

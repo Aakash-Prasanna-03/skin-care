@@ -58,17 +58,20 @@ class TrainConfig:
     beta: float = 0.1                     # Smooth L1 beta (lower = more L1-like, outlier-robust)
 
     # ── Per-head loss weights ─────────────────────────────────────────────────
-    acne_weight: float = 3.0
+    acne_weight: float = 2.0
     redness_weight: float = 1.2
     texture_weight: float = 0.8
     dark_circle_weight: float = 1.5
 
+<<<<<<< HEAD
     # Progressive acne weight: linearly ramps from acne_weight to this value
     acne_weight_final: float = 4.5
 
     # Differential LR: backbone/shared trunk use lr * this factor
     backbone_lr_factor: float = 0.3
 
+=======
+>>>>>>> parent of 7e1e563 (more detailed for acne and all)
     acne_dataset_weight: float = 4.0      # Higher: ACNE04 is the only acne source
     celeba_dataset_weight: float = 1.0
     ffhq_dataset_weight: float = 1.5

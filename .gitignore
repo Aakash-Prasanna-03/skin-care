@@ -1,6 +1,3 @@
-bestmodels/
-prediction_results_acne/
-files.zip
 # ── Data & images ──────────────────────────────────────────────
 data/
 !data/**/*.md

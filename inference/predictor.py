@@ -11,7 +11,6 @@ from pathlib import Path
 from typing import Dict, Optional, Union
 
 import cv2
-import numpy as np
 import torch
 
 from config import InferenceConfig
@@ -68,6 +67,7 @@ def _score_to_severity(score: float) -> str:
     return "Severe"
 
 
+<<<<<<< HEAD
 def _estimate_skin_tone(bgr: np.ndarray) -> float:
     """Estimate skin lightness from the cheek area. Returns OpenCV L* in [0, 255].
 
@@ -120,6 +120,9 @@ class SkinPredictor:
             # Severe: map [0.75, 1.0] → [0.70, 1.0]
             return 0.70 + (raw - 0.75) * 1.2
 
+=======
+class SkinPredictor:
+>>>>>>> parent of 7e1e563 (more detailed for acne and all)
     MIN_BRIGHTNESS = 60.0
     MAX_BRIGHTNESS = 200.0
     MIN_BLUR_VARIANCE = 80.0
@@ -158,12 +161,10 @@ class SkinPredictor:
         if quality_error is not None:
             return SkinReport(0.0, 0.0, 0.0, 0.0, 0.0, face_detected=bool(quality.get("face_detected", False)), error=quality_error, quality_checks=quality)
 
-        skin_lightness = _estimate_skin_tone(bgr)
-
         regions, _ = self.preprocessor(bgr)
         if regions is None:
             return SkinReport(0.0, 0.0, 0.0, 0.0, 0.0, face_detected=False, error="Face alignment failed for this image.", quality_checks=quality)
-        return self._run_model(regions, quality, skin_lightness=skin_lightness)
+        return self._run_model(regions, quality)
 
     def _quality_error(self, quality: Dict[str, object]) -> Optional[str]:
         if not quality.get("face_detected", False):
@@ -203,6 +204,7 @@ class SkinPredictor:
 
         return sum(adjusted[k] * weights[k] for k in adjusted) / total_w
 
+<<<<<<< HEAD
     @staticmethod
     def _calibrate_acne(raw: float) -> float:
         """Remap acne so:
@@ -293,19 +295,20 @@ class SkinPredictor:
         acne_implied_texture = acne * (0.23 + acne * 0.47)
         return max(texture, acne_implied_texture)
 
+=======
+>>>>>>> parent of 7e1e563 (more detailed for acne and all)
     @torch.no_grad()
-    def _run_model(self, regions: Dict[str, torch.Tensor], quality: Dict[str, object], skin_lightness: float = 140.0) -> SkinReport:
+    def _run_model(self, regions: Dict[str, torch.Tensor], quality: Dict[str, object]) -> SkinReport:
         inputs = {key: value.unsqueeze(0).to(self.device) for key, value in regions.items()}
         with torch.amp.autocast(device_type="cuda", enabled=self.device.type == "cuda"):
             scores = self.model(inputs)
 
         raw = scores.to_cpu_dict()
-
-        # 1. Base clamping
         acne = self._clamp_score(float(raw["acne_score"]))
         redness = self._clamp_score(float(raw["redness_score"]))
         texture = self._clamp_score(float(raw["texture_score"]))
         dark_circle = self._clamp_score(float(raw["dark_circle_score"]))
+<<<<<<< HEAD
 
         # 2. Calibrate all scores to proper ranges
         acne = self._clamp_score(self._calibrate_acne(acne))
@@ -322,6 +325,8 @@ class SkinPredictor:
         # 4. Acne-correlated adjustments
         redness = self._clamp_score(self._apply_acne_redness_correlation(acne, redness))
         texture = self._clamp_score(self._apply_acne_texture_correlation(acne, texture))
+=======
+>>>>>>> parent of 7e1e563 (more detailed for acne and all)
 
         score_dict = {"acne": acne, "redness": redness, "texture": texture, "dark_circle": dark_circle}
         overall = self._clamp_score(self._robust_overall(score_dict))
